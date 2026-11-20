@@ -1,0 +1,12 @@
+; DO NOT EDIT (unless you know what you are doing)
+;
+; This subdirectory is a git "subrepo", and this file is maintained by the
+; git-subrepo command. See https://github.com/ingydotnet/git-subrepo#readme
+;
+[subrepo]
+	remote = https://github.com/mitmedialab/suede.canvas-placement
+	branch = release
+	commit = 9272a8c32cadfe871b2e62a2e7e081c9c6b7d83f
+	parent = 58df9dd598bdf310a94505ba91b999645015bb70
+	method = merge
+	cmdver = 0.4.9
