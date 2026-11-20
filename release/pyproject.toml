@@ -1,0 +1,19 @@
+[build-system]
+requires = ["maturin>=1.5,<2"]
+build-backend = "maturin"
+
+[project]
+name = "canvas-placement"
+dynamic = ["version"]   # taken from Cargo.toml
+description = "Stateless drawing placement for doodlebot canvases"
+requires-python = ">=3.11"
+
+[tool.maturin]
+features = ["python"]
+module-name = "canvas_placement"
+# suede machinery is not part of the Python package
+exclude = [
+  { path = ".github/**/*", format = "sdist" },
+  { path = ".suede/**/*", format = "sdist" },
+  { path = ".gitrepo", format = "sdist" },
+]

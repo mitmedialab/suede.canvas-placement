@@ -1,0 +1,151 @@
+name: build-release
+#
+# Lives on `main` only (not under release/, so it never ships to consumers).
+# Tests the crate in ./release, builds installable artifacts from it and attaches
+# them to a GitHub Release, so a consumer that only wants the compiled module
+# can install it without a Rust toolchain:
+#
+#   canvas_placement-<ver>-*.whl      abi3 wheels, Python >= 3.11 (pip install <url>)
+#   canvas_placement-<ver>.tar.gz     sdist (builds from source, needs Rust)
+#
+# Publishing: push a tag `v<version>` matching release/Cargo.toml, or run the
+# workflow by hand (it tags the current commit as `v<version>`). Pull requests
+# touching release/ test and build everything but publish nothing.
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - "release/**"
+      - ".github/workflows/build-release.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' release/Cargo.toml | head -1)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [[ "$GITHUB_REF" == refs/tags/* && "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match release/Cargo.toml version $version"
+            exit 1
+          fi
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --release --manifest-path release/Cargo.toml
+      - run: cargo build --release --features cli --manifest-path release/Cargo.toml
+
+  wheels:
+    needs: [version, test]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64 }
+          - { os: ubuntu-latest, target: aarch64 }
+          - { os: macos-latest, target: universal2-apple-darwin }
+          - { os: windows-latest, target: x64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # abi3-py311: one wheel per platform covers every CPython >= 3.11.
+      - uses: PyO3/maturin-action@v1
+        with:
+          working-directory: release
+          target: ${{ matrix.target }}
+          args: --release --out dist
+          manylinux: auto
+      - name: Smoke-test the wheel
+        # Cross-compiled aarch64 wheels cannot run on the x86_64 runner.
+        if: matrix.target != 'aarch64'
+        shell: bash
+        run: |
+          python -m pip install --no-index --find-links release/dist canvas-placement
+          python -c "
+          import canvas_placement as cp
+          square = [c for _ in range(4) for c in ({'kind': 'line', 'distance': 100.0, 'penDown': True},
+                                                  {'kind': 'spin', 'degrees': 90.0})]
+          canvas = {'general_buffer': 25.0, 'regions': [{'id': 'r', 'x': 0, 'y': 0, 'width': 1000,
+                    'height': 1000, 'robot': 'bot', 'config': {'strategy': 'origin'}}]}
+          p = cp.place({'canvas': canvas, 'region_id': 'r',
+                        'job': {'commands': square, 'heading0': 0.0, 'native_span': 100.0}})
+          assert p is not None and p['scale_fraction'] == 1.0, p
+          drawing = {'robot_name': 'bot', 'strokes': [[(0.0, 0.0), (100.0, 0.0)]]}
+          assert cp.free_fractions({'canvas': canvas, 'drawings': [drawing]})['r'] < 1.0
+          occ = cp.occupancy({'canvas': canvas, 'drawings': [drawing], 'region_id': 'r'})
+          assert len(occ['ink']) == occ['rows'] * occ['cols']
+          print('ok:', p)
+          "
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-wheel-${{ matrix.os }}-${{ matrix.target }}
+          path: release/dist/*
+
+  sdist:
+    needs: [version, test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          working-directory: release
+          command: sdist
+          args: --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-sdist
+          path: release/dist/*
+
+  publish:
+    needs: [version, wheels, sdist]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: v${{ needs.version.outputs.version }}
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+      - run: ls -la dist
+      - name: Write release notes
+        run: |
+          base="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG"
+          cat > notes.md <<EOF
+          Built from \`release/\` at $GITHUB_SHA.
+
+          **Python** >= 3.11 (pip picks the right wheel for your platform)
+          \`\`\`
+          pip install canvas-placement --find-links https://github.com/$GITHUB_REPOSITORY/releases/expanded_assets/$TAG
+          \`\`\`
+          or a specific wheel: \`pip install "canvas-placement @ $base/<wheel file name>"\`
+          EOF
+      - name: Create or update the release
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+            gh release edit "$TAG" --notes-file notes.md --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" dist/* --title "$TAG" --notes-file notes.md \
+              --target "$GITHUB_SHA" --repo "$GITHUB_REPOSITORY"
+          fi
