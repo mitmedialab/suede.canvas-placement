@@ -48,20 +48,13 @@ pub struct PlacementConfig {
     pub strategy: Strategy,
     pub target_footprint_mm: f64,
     pub min_footprint_scale: f64,
-    /// `scatter` only: how many valid poses to draw before keeping the one with
-    /// the most clearance (best-candidate sampling). 1 is a plain uniform pick;
-    /// higher spreads drawings out — about 8 leaves open space between them
-    /// while still looking hand-placed. Each extra candidate may cost one more
-    /// rotation's free-offset search.
+    /// `scatter` only: how many valid poses to draw before keeping the one
+    /// farthest from existing ink (best-candidate sampling). 1 is a plain
+    /// uniform pick; 8 spreads drawings out while still looking hand-placed
+    /// (more did no better in testing). Each extra candidate may cost one more
+    /// rotation's free-offset search (about a third of a millisecond on an open
+    /// canvas).
     pub scatter_candidates: u32,
-    /// `scatter` with more than one candidate: how much the region's edges count
-    /// as obstacles when measuring clearance (a cell's clearance is the nearer of
-    /// its distance to ink and its distance to an edge ÷ `edge_weight`).
-    /// 0 = not at all: the most spread out, but drawings sit on the edges as often
-    /// as a plain pick. 1 = as much as ink: off the edges, but the edges then
-    /// dominate and spreading mostly vanishes. 0.25 (the default) keeps most of
-    /// the spreading and keeps drawings off the edges.
-    pub edge_weight: f64,
 }
 
 impl Default for PlacementConfig {
@@ -76,7 +69,6 @@ impl Default for PlacementConfig {
             target_footprint_mm: 200.0,
             min_footprint_scale: 0.4,
             scatter_candidates: 1,
-            edge_weight: 0.25,
         }
     }
 }

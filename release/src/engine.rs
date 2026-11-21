@@ -196,29 +196,17 @@ struct Context<'a> {
     /// `active_bodies`' bbox grown by our reach: (top, left, bottom, right).
     reach_bbox: Option<(i64, i64, i64, i64)>,
     body: RobotBody,
-    /// Per cell, how far it is from committed ink (and from the region's edges,
-    /// per `edge_weight`), in cells. Only built when scatter compares several
-    /// candidates.
+    /// Per cell, how far it is from committed ink, in cells. Only built when
+    /// scatter compares several candidates.
     clearance: Option<Vec<f64>>,
 }
 
-/// Each cell's distance to the nearest committed ink, or to the region's edge
-/// divided by `edge_weight` if that is nearer — the quantity best-candidate
-/// scatter maximizes. Cells, centre to centre.
-fn clearance_map(ink: &Mask, edge_weight: f64) -> Vec<f64> {
-    let (rows, cols) = (ink.rows, ink.cols);
-    let mut map: Vec<f64> = squared_distance_map(ink).into_iter().map(f64::sqrt).collect();
-    if edge_weight > 0.0 {
-        for r in 0..rows {
-            let to_row_edge = (r as f64 + 0.5).min(rows as f64 - r as f64 - 0.5);
-            for c in 0..cols {
-                let to_edge = to_row_edge.min(c as f64 + 0.5).min(cols as f64 - c as f64 - 0.5);
-                let v = &mut map[r * cols + c];
-                *v = v.min(to_edge / edge_weight);
-            }
-        }
-    }
-    map
+/// Each cell's distance to the nearest committed ink — the quantity
+/// best-candidate scatter maximizes. Cells, centre to centre; effectively
+/// unbounded where there is no ink. The region's edges don't count: regions are
+/// laid out to keep drawings where they belong.
+fn clearance_map(ink: &Mask) -> Vec<f64> {
+    squared_distance_map(ink).into_iter().map(f64::sqrt).collect()
 }
 
 fn prepare<'a>(
@@ -245,7 +233,7 @@ fn prepare<'a>(
 
     let cfg = &region.config;
     let clearance = (cfg.strategy == Strategy::Scatter && cfg.scatter_candidates > 1)
-        .then(|| clearance_map(&ink, cfg.edge_weight));
+        .then(|| clearance_map(&ink));
 
     Context {
         region,
@@ -672,16 +660,15 @@ mod tests {
         assert!(gap > RobotBody::default().min_overhang_mm(), "pen within {gap:.1}mm of a live robot");
     }
 
-    /// Scatter `n` drawings (100mm squares at 150mm) with `k` candidates and the
-    /// given edge weight; returns each drawing's gap to the ones before it.
-    fn scatter_gaps(k: u32, edge_weight: f64, seed: u64, n: usize) -> (Vec<DrawingSpec>, Vec<f64>) {
+    /// Scatter `n` drawings (100mm squares at 150mm) with `k` candidates;
+    /// returns them and each drawing's gap to the ones before it.
+    fn scatter_gaps(k: u32, seed: u64, n: usize) -> (Vec<DrawingSpec>, Vec<f64>) {
         let mut drawings: Vec<DrawingSpec> = Vec::new();
         let mut gaps = Vec::new();
         for i in 0..n {
             let mut req = request(Strategy::Scatter, drawings.clone());
             let cfg = &mut req.canvas.regions[0].config;
             cfg.scatter_candidates = k;
-            cfg.edge_weight = edge_weight;
             cfg.target_footprint_mm = 150.0;
             req.seed = seed * 1000 + i as u64;
             let Some(p) = place(&req).unwrap() else { break };
@@ -704,40 +691,19 @@ mod tests {
 
     #[test]
     fn best_candidate_scatter_leaves_more_room() {
-        // At the default edge weight. (Measured: median gap ~186mm vs ~128mm.)
-        let w = PlacementConfig::default().edge_weight;
-        let (mut one, mut eight) = (Vec::new(), Vec::new());
+        let (mut one, mut many) = (Vec::new(), Vec::new());
         for seed in 0..12 {
-            one.extend(scatter_gaps(1, w, seed, 6).1);
-            eight.extend(scatter_gaps(8, w, seed, 6).1);
+            one.extend(scatter_gaps(1, seed, 6).1);
+            many.extend(scatter_gaps(8, seed, 6).1);
         }
-        let (m1, m8) = (median(one), median(eight));
+        let (m1, m8) = (median(one), median(many));
         assert!(m8 > m1 * 1.3, "median gap {m8:.0}mm with 8 candidates vs {m1:.0}mm with 1");
-    }
-
-    #[test]
-    fn default_edge_weight_keeps_drawings_off_the_edges() {
-        // How many drawings land within 40mm of an edge. (Measured: ~15% with a
-        // plain pick, ~3% with 8 candidates at the default weight.)
-        let near_edge = |k: u32| {
-            let (mut near, mut total) = (0, 0);
-            for seed in 0..12 {
-                for d in scatter_gaps(k, PlacementConfig::default().edge_weight, seed, 6).0 {
-                    let (x0, y0, x1, y1) = bounds(&d.strokes).unwrap();
-                    near += (x0.min(y0).min(1000.0 - x1).min(1000.0 - y1) < 40.0) as usize;
-                    total += 1;
-                }
-            }
-            near as f64 / total as f64
-        };
-        let (one, eight) = (near_edge(1), near_edge(8));
-        assert!(eight < one * 0.5, "{:.0}% near an edge with 8 candidates vs {:.0}% with 1", eight * 100.0, one * 100.0);
     }
 
     #[test]
     fn best_candidate_scatter_still_never_crowds() {
         for seed in 0..4 {
-            let (drawings, gaps) = scatter_gaps(8, 0.25, seed, 12);
+            let (drawings, gaps) = scatter_gaps(8, seed, 12);
             assert!(drawings.len() >= 6, "placed only {}", drawings.len());
             assert!(gaps.iter().all(|&g| g >= 25.0), "a gap under the 25mm buffer: {gaps:?}");
         }
@@ -745,8 +711,8 @@ mod tests {
 
     #[test]
     fn best_candidate_scatter_is_deterministic() {
-        let a = scatter_gaps(8, 0.5, 3, 5).0;
-        let b = scatter_gaps(8, 0.5, 3, 5).0;
+        let a = scatter_gaps(8, 3, 5).0;
+        let b = scatter_gaps(8, 3, 5).0;
         assert_eq!(a.len(), b.len());
         for (x, y) in a.iter().zip(&b) {
             assert_eq!(x.strokes, y.strokes);
@@ -754,35 +720,15 @@ mod tests {
     }
 
     #[test]
-    fn edge_weight_decides_whether_edges_repel() {
-        // On an empty region the only obstacles are the edges: counting them
-        // pulls the first drawing toward the middle; ignoring them doesn't.
-        let centre_dist = |w: f64| {
-            let mut total = 0.0;
-            for seed in 0..10 {
-                let d = &scatter_gaps(8, w, seed, 1).0[0];
-                let (x0, y0, x1, y1) = bounds(&d.strokes).unwrap();
-                total += ((x0 + x1) / 2.0 - 500.0).hypot((y0 + y1) / 2.0 - 500.0);
-            }
-            total / 10.0
-        };
-        let (counted, ignored) = (centre_dist(1.0), centre_dist(0.0));
-        assert!(counted < ignored * 0.6, "{counted:.0}mm from centre with edges counted vs {ignored:.0}mm ignored");
-    }
-
-    #[test]
-    fn clearance_map_measures_ink_and_edges() {
+    fn clearance_map_measures_distance_to_ink() {
         let mut ink = Mask::new(10, 20);
         ink.set(5, 15);
-        let m = clearance_map(&ink, 0.0); // ink only
+        let m = clearance_map(&ink);
         assert_eq!(m[5 * 20 + 15], 0.0);
         assert!((m[5 * 20 + 12] - 3.0).abs() < 1e-12);
         assert!((m[1 * 20 + 12] - 5.0).abs() < 1e-12); // 4 rows, 3 cols: 3-4-5
-        let m = clearance_map(&ink, 1.0); // edges count too
-        assert!((m[5 * 20] - 0.5).abs() < 1e-12); // left edge, half a cell away
-        let m = clearance_map(&ink, 0.5); // edges count for half
-        assert!((m[5 * 20] - 1.0).abs() < 1e-12);
-        let m = clearance_map(&Mask::new(4, 4), 0.0); // no ink, no edges: unbounded
+        assert!((m[5 * 20] - 15.0).abs() < 1e-12); // edges don't count
+        let m = clearance_map(&Mask::new(4, 4)); // no ink: unbounded
         assert!(m.iter().all(|&v| v > 1e9));
     }
 
