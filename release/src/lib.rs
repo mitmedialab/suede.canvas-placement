@@ -31,5 +31,8 @@ mod clock;
 #[cfg(feature = "python")]
 mod python;
 
+#[cfg(feature = "wasm")]
+mod wasm;
+
 pub use engine::{free_fractions, occupancy, place};
 pub use types::*;

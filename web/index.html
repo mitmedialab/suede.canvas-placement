@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>canvas_placement demo</title>
+<style>
+  body { font: 14px/1.4 system-ui, sans-serif; margin: 16px; color: #222; background: #fafafa; }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  p { margin: 4px 0 12px; color: #555; max-width: 60em; }
+  .controls { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin-bottom: 12px; }
+  label { display: flex; gap: 6px; align-items: center; }
+  input[type=number] { width: 5em; }
+  canvas { background: #fff; border: 1px solid #bbb; max-width: 100%; height: auto; }
+  #status { color: #555; font-variant-numeric: tabular-nums; }
+  .err { color: #b00; }
+</style>
+</head>
+<body>
+<h1>canvas_placement</h1>
+<p>The placement engine compiled to WebAssembly. Each <b>Place</b> asks <code>place()</code> where a new drawing
+fits on a 1&nbsp;m region, given everything already drawn — nothing is remembered between calls; the page passes
+the drawings in every time. Drawings shrink to fit when the region fills up; when nothing fits, it says so.</p>
+<div class="controls">
+  <label>Shape <select id="shape"><option value="star">star</option><option value="zigzag">zigzag</option>
+    <option value="spiral">spiral</option><option value="square">square</option></select></label>
+  <label>Strategy <select id="strategy"><option value="scatter">scatter</option><option value="origin">origin</option></select></label>
+  <label>Size (mm) <input id="size" type="number" value="220" min="50" max="600" step="10"></label>
+  <label>Buffer (mm) <input id="buffer" type="number" value="30" min="0" max="200" step="5"></label>
+  <button id="place">Place</button>
+  <button id="fill">Fill</button>
+  <button id="clear">Clear</button>
+</div>
+<canvas id="c" width="700" height="700"></canvas>
+<div id="status">Loading…</div>
+<script type="module">
+// Where the wasm comes from: ./pkg-web/ on GitHub Pages, ?wasm=local for your own
+// build (release/pkg-web/), or ?wasm=<base url> for any other copy.
+const param = new URLSearchParams(location.search).get("wasm");
+const base = param === "local" ? "../release/pkg-web" : (param || "./pkg-web");
+const { default: init, place } = await import(`${base}/canvas_placement.js`);
+await init();
+
+const SIZE = 1000, SCALE = 700 / SIZE;
+const ctx = document.getElementById("c").getContext("2d");
+const statusEl = document.getElementById("status");
+const $ = (id) => document.getElementById(id);
+let drawings = [];
+
+// --- drawings as robot commands ---------------------------------------------
+const line = (distance, penDown = true) => ({ kind: "line", distance, penDown });
+const spin = (degrees) => ({ kind: "spin", degrees });
+const arc = (radius, degrees) => ({ kind: "arc", radius, degrees });
+const SHAPES = {
+  star: () => Array.from({ length: 5 }, () => [line(100), spin(144)]).flat(),
+  zigzag: () => Array.from({ length: 6 }, (_, i) => [line(40), spin(i % 2 ? 120 : -120)]).flat(),
+  spiral: () => Array.from({ length: 6 }, (_, i) => arc(10 + 8 * i, 180)),
+  square: () => Array.from({ length: 4 }, () => [line(100), spin(90)]).flat(),
+};
+
+// Turtle-integrate commands into pen-down strokes (arcs in <= 6 degree chords),
+// exactly as the engine does.
+function strokes(commands, scale = 1, x = 0, y = 0, heading = 0) {
+  const out = []; let cur = [];
+  const flush = () => { if (cur.length >= 2) out.push(cur); cur = []; };
+  const step = (d, pen) => {
+    const r = heading * Math.PI / 180, nx = x + d * Math.cos(r), ny = y + d * Math.sin(r);
+    if (pen) { if (!cur.length) cur.push([x, y]); cur.push([nx, ny]); } else flush();
+    x = nx; y = ny;
+  };
+  for (const c of commands) {
+    if (c.kind === "line") step(c.distance * scale, c.penDown);
+    else if (c.kind === "spin") heading += c.degrees;
+    else {
+      const n = Math.max(1, Math.ceil(Math.abs(c.degrees) / 6)), dt = c.degrees / n;
+      const seg = c.radius * scale * Math.abs(dt) * Math.PI / 180;
+      for (let i = 0; i < n; i++) { step(seg, true); heading += dt; }
+    }
+  }
+  flush();
+  return out;
+}
+
+function span(st) {
+  const xs = st.flat().map((p) => p[0]), ys = st.flat().map((p) => p[1]);
+  return Math.max(Math.max(...xs) - Math.min(...xs), Math.max(...ys) - Math.min(...ys));
+}
+
+// --- one placement ------------------------------------------------------------
+function placeOne() {
+  const commands = SHAPES[$("shape").value]();
+  const canvas = {
+    width: SIZE, height: SIZE, general_buffer: +$("buffer").value,
+    regions: [{ id: "r", x: 0, y: 0, width: SIZE, height: SIZE, robot: "bot",
+                config: { strategy: $("strategy").value, target_footprint_mm: +$("size").value } }],
+  };
+  const t = performance.now();
+  const p = place({
+    canvas, drawings, region_id: "r",
+    job: { commands, heading0: 0, native_span: span(strokes(commands)) },
+    seed: Math.floor(Math.random() * 2 ** 32),
+  });
+  const ms = performance.now() - t;
+  if (!p) return { placed: false, ms };
+  // What the robot would draw: the commands at p.scale, from the anchor, at p.angle_deg.
+  drawings.push({ robot_name: "bot", strokes: strokes(commands, p.scale, p.anchor_x, p.anchor_y, p.angle_deg) });
+  return { placed: true, ms, p };
+}
+
+function render(newest) {
+  ctx.clearRect(0, 0, 700, 700);
+  drawings.forEach((d, i) => {
+    ctx.strokeStyle = i === drawings.length - 1 && newest ? "#000" : `hsl(${(i * 47) % 360} 60% 45%)`;
+    ctx.lineWidth = i === drawings.length - 1 && newest ? 2.5 : 1.5;
+    for (const s of d.strokes) {
+      ctx.beginPath();
+      s.forEach(([x, y], j) => (j ? ctx.lineTo(x * SCALE, y * SCALE) : ctx.moveTo(x * SCALE, y * SCALE)));
+      ctx.stroke();
+    }
+  });
+}
+
+function report(r) {
+  statusEl.className = "";
+  statusEl.textContent = r.placed
+    ? `${drawings.length} drawing(s). Last: ${Math.round(r.p.scale_fraction * 100)}% of target size, ` +
+      `rotated ${r.p.angle_deg}°, ${r.ms.toFixed(1)} ms. Region ${Math.round(r.p.free_fraction_after * 100)}% free.`
+    : `Nothing more fits (${drawings.length} drawing(s); looked for ${r.ms.toFixed(1)} ms).`;
+}
+
+$("place").onclick = () => { const r = placeOne(); render(r.placed); report(r); };
+$("fill").onclick = async () => {
+  let r, misses = 0;
+  while (misses < 3) {
+    r = placeOne(); misses = r.placed ? 0 : misses + 1;
+    render(r.placed); report(r);
+    await new Promise((res) => setTimeout(res, 120));
+  }
+};
+$("clear").onclick = () => { drawings = []; render(false); statusEl.textContent = "Cleared."; };
+statusEl.textContent = "Ready.";
+</script>
+<noscript>This demo needs JavaScript and WebAssembly.</noscript>
+</body>
+</html>
