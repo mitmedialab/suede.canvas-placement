@@ -3,7 +3,10 @@
 use crate::clock::Deadline;
 use crate::fftcorr::Correlator;
 use crate::geometry::{body_sweep, bounds, local_strokes, rotate_strokes};
-use crate::raster::{body_sweep_mask, dilate_ellipse, rasterize, within_distance, BodySweep, Footprint, Mask};
+use crate::raster::{
+    body_sweep_mask, dilate_ellipse, rasterize, squared_distance_map, within_distance, BodySweep, Footprint,
+    Mask,
+};
 use crate::rng::Rng;
 use crate::types::*;
 use std::collections::HashMap;
@@ -193,6 +196,17 @@ struct Context<'a> {
     /// `active_bodies`' bbox grown by our reach: (top, left, bottom, right).
     reach_bbox: Option<(i64, i64, i64, i64)>,
     body: RobotBody,
+    /// Per cell, how far it is from committed ink, in cells. Only built when
+    /// scatter compares several candidates.
+    clearance: Option<Vec<f64>>,
+}
+
+/// Each cell's distance to the nearest committed ink — the quantity
+/// best-candidate scatter maximizes. Cells, centre to centre; effectively
+/// unbounded where there is no ink. The region's edges don't count: regions are
+/// laid out to keep drawings where they belong.
+fn clearance_map(ink: &Mask) -> Vec<f64> {
+    squared_distance_map(ink).into_iter().map(f64::sqrt).collect()
 }
 
 fn prepare<'a>(
@@ -217,6 +231,10 @@ fn prepare<'a>(
         )
     });
 
+    let cfg = &region.config;
+    let clearance = (cfg.strategy == Strategy::Scatter && cfg.scatter_candidates > 1)
+        .then(|| clearance_map(&ink));
+
     Context {
         region,
         rows,
@@ -226,6 +244,7 @@ fn prepare<'a>(
         active_bodies: bodies,
         reach_bbox,
         body: *body,
+        clearance,
     }
 }
 
@@ -290,8 +309,28 @@ impl Context<'_> {
         }
     }
 
+    /// How much room a footprint placed at (top, left) has: the least clearance
+    /// over the cells it covers.
+    fn footprint_clearance(&self, map: &[f64], mask: &Mask, top: usize, left: usize) -> f64 {
+        let mut least = f64::INFINITY;
+        for r in 0..mask.rows {
+            let row = &map[(top + r) * self.cols + left..][..mask.cols];
+            for (&m, &c) in mask.row(r).iter().zip(row) {
+                if m != 0 && c < least {
+                    least = c;
+                }
+            }
+        }
+        least
+    }
+
     /// A collision-free pose for `strokes` (rotation + offset), or None
     /// (canvas.py `Region.try_place`).
+    ///
+    /// Scatter with `scatter_candidates` = k > 1 draws one candidate from each of
+    /// the first k rotations (in shuffled order) that have room, each picked
+    /// exactly as k = 1 picks its single pose, and keeps the one whose footprint
+    /// has the most clearance (ties: the earlier). k = 1 is a plain uniform pick.
     fn try_place(&self, strokes: &[Stroke], rng: &mut Rng) -> Option<Found> {
         if strokes.is_empty() {
             return None;
@@ -305,6 +344,10 @@ impl Context<'_> {
             rng.shuffle(&mut angles);
         }
         let narrow = self.reach_bbox.is_some();
+        // Best-candidate scatter: (clearance, pose) of the roomiest so far.
+        let candidates = cfg.scatter_candidates.max(1);
+        let mut drawn = 0u32;
+        let mut roomiest: Option<(f64, Found)> = None;
 
         let mut best: Option<Found> = None;
         let mut best_key: Option<(usize, usize)> = None;
@@ -337,19 +380,30 @@ impl Context<'_> {
             }
 
             if scatter {
-                if !narrow {
-                    let (t, l) = coords[rng.below(coords.len())];
-                    return Some(self.found(&st, anchor_local, t, l));
+                // This rotation's pick: a uniform free offset, or with a live
+                // neighbour, the first in a shuffled order whose chassis clears it.
+                let pick = if !narrow {
+                    Some(coords[rng.below(coords.len())])
+                } else {
+                    let mut order: Vec<usize> = (0..coords.len()).collect();
+                    rng.shuffle(&mut order);
+                    order.into_iter().map(|i| coords[i]).find(|&(t, l)| !self.body_collides(&mut st, t, l))
+                };
+                let Some((t, l)) = pick else {
+                    continue; // every free offset here would clip a live robot
+                };
+                let Some(map) = self.clearance.as_deref().filter(|_| candidates > 1) else {
+                    return Some(self.found(&st, anchor_local, t, l)); // k = 1
+                };
+                let room = self.footprint_clearance(map, &st.fp.mask, t, l);
+                if roomiest.as_ref().map_or(true, |(best_room, _)| room > *best_room) {
+                    roomiest = Some((room, self.found(&st, anchor_local, t, l)));
                 }
-                let mut order: Vec<usize> = (0..coords.len()).collect();
-                rng.shuffle(&mut order);
-                for i in order {
-                    let (t, l) = coords[i];
-                    if !self.body_collides(&mut st, t, l) {
-                        return Some(self.found(&st, anchor_local, t, l));
-                    }
+                drawn += 1;
+                if drawn == candidates {
+                    break;
                 }
-                continue; // every free offset here would clip a live robot
+                continue;
             }
 
             // Origin: first survivor is this angle's best; stop once we can't
@@ -368,6 +422,9 @@ impl Context<'_> {
             if best_key == Some((0, 0)) {
                 break; // nothing beats the corner
             }
+        }
+        if scatter {
+            return roomiest.map(|(_, found)| found);
         }
         best
     }
@@ -601,6 +658,78 @@ mod tests {
             ink.into_iter().map(|s| s.into_iter().map(|(x, y)| (x + p.anchor_x, y + p.anchor_y)).collect()).collect();
         let gap = min_distance(&world, &[vec![(0.0, 100.0), (300.0, 100.0)]]);
         assert!(gap > RobotBody::default().min_overhang_mm(), "pen within {gap:.1}mm of a live robot");
+    }
+
+    /// Scatter `n` drawings (100mm squares at 150mm) with `k` candidates;
+    /// returns them and each drawing's gap to the ones before it.
+    fn scatter_gaps(k: u32, seed: u64, n: usize) -> (Vec<DrawingSpec>, Vec<f64>) {
+        let mut drawings: Vec<DrawingSpec> = Vec::new();
+        let mut gaps = Vec::new();
+        for i in 0..n {
+            let mut req = request(Strategy::Scatter, drawings.clone());
+            let cfg = &mut req.canvas.regions[0].config;
+            cfg.scatter_candidates = k;
+            cfg.target_footprint_mm = 150.0;
+            req.seed = seed * 1000 + i as u64;
+            let Some(p) = place(&req).unwrap() else { break };
+            let world: Vec<Stroke> = local_strokes(&req.job.commands, p.scale, p.angle_deg)
+                .into_iter()
+                .map(|s| s.into_iter().map(|(x, y)| (x + p.anchor_x, y + p.anchor_y)).collect())
+                .collect();
+            if let Some(gap) = drawings.iter().map(|d| min_distance(&d.strokes, &world)).reduce(f64::min) {
+                gaps.push(gap);
+            }
+            drawings.push(DrawingSpec { robot_name: "bot".into(), strokes: world });
+        }
+        (drawings, gaps)
+    }
+
+    fn median(mut xs: Vec<f64>) -> f64 {
+        xs.sort_by(f64::total_cmp);
+        xs[xs.len() / 2]
+    }
+
+    #[test]
+    fn best_candidate_scatter_leaves_more_room() {
+        let (mut one, mut many) = (Vec::new(), Vec::new());
+        for seed in 0..12 {
+            one.extend(scatter_gaps(1, seed, 6).1);
+            many.extend(scatter_gaps(8, seed, 6).1);
+        }
+        let (m1, m8) = (median(one), median(many));
+        assert!(m8 > m1 * 1.3, "median gap {m8:.0}mm with 8 candidates vs {m1:.0}mm with 1");
+    }
+
+    #[test]
+    fn best_candidate_scatter_still_never_crowds() {
+        for seed in 0..4 {
+            let (drawings, gaps) = scatter_gaps(8, seed, 12);
+            assert!(drawings.len() >= 6, "placed only {}", drawings.len());
+            assert!(gaps.iter().all(|&g| g >= 25.0), "a gap under the 25mm buffer: {gaps:?}");
+        }
+    }
+
+    #[test]
+    fn best_candidate_scatter_is_deterministic() {
+        let a = scatter_gaps(8, 3, 5).0;
+        let b = scatter_gaps(8, 3, 5).0;
+        assert_eq!(a.len(), b.len());
+        for (x, y) in a.iter().zip(&b) {
+            assert_eq!(x.strokes, y.strokes);
+        }
+    }
+
+    #[test]
+    fn clearance_map_measures_distance_to_ink() {
+        let mut ink = Mask::new(10, 20);
+        ink.set(5, 15);
+        let m = clearance_map(&ink);
+        assert_eq!(m[5 * 20 + 15], 0.0);
+        assert!((m[5 * 20 + 12] - 3.0).abs() < 1e-12);
+        assert!((m[1 * 20 + 12] - 5.0).abs() < 1e-12); // 4 rows, 3 cols: 3-4-5
+        assert!((m[5 * 20] - 15.0).abs() < 1e-12); // edges don't count
+        let m = clearance_map(&Mask::new(4, 4)); // no ink: unbounded
+        assert!(m.iter().all(|&v| v > 1e9));
     }
 
     fn min_distance(a: &[Stroke], b: &[Stroke]) -> f64 {
