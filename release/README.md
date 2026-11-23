@@ -185,8 +185,15 @@ cargo build --release --features cli
 ## How it works
 
 1. **Occupancy.** Each drawing in the region is rasterized at `cell_mm` (a cell
-   is ink if its centre is within `pen/2 + clearance` of a stroke), then grown
-   by `general_buffer` with an elliptical dilation. Robots drawing in adjoining
+   is ink if its centre is within `pen/2 + clearance` of a stroke), with any
+   area the drawing's own lines enclose filled in, then grown by
+   `general_buffer` with an elliptical dilation. The fill is what keeps
+   drawings out of each other: nothing is placed inside a square, and a square
+   is never placed around anything, because the new drawing's footprint is
+   filled the same way. Only closed shapes count — a "C" or a spiral leaves its
+   inside free (a gap the ink itself closes, about `pen + 2 × clearance`, counts
+   as closed) — and only one drawing's own lines: space ringed by several
+   drawings stays usable. Robots drawing in adjoining
    regions add the rectangle their chassis sweeps along each stroke, grown by
    the body's inscribed radius (where a collision is certain at any heading).
 2. **Search.** For each rotation, every collision-free offset comes from one FFT
