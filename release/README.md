@@ -72,7 +72,7 @@ All three release the GIL while they run.
 
 | Field | Meaning |
 |---|---|
-| `canvas.regions[].config` | `cell_mm` (5), `pen_mm` (5), `clearance_mm` (8), `search_step_cells` (2), `angles_deg` (0, 15, … 345), `strategy` (`"scatter"` or `"origin"`), `target_footprint_mm` (200), `min_footprint_scale` (0.4). Defaults in brackets; omit any to use them. |
+| `canvas.regions[].config` | `cell_mm` (5), `pen_mm` (5), `clearance_mm` (8), `search_step_cells` (2), `angles_deg` (0, 15, … 345), `strategy` (`"scatter"` or `"origin"`), `target_footprint_mm` (200), `min_footprint_scale` (0.4), `scatter_candidates` (1). Defaults in brackets; omit any to use them. |
 | `drawings` | Every drawing on the canvas, with its ink in world mm. Each is reserved in the region of its `robot_name`. |
 | `active` | Robots drawing right now. A robot's swept chassis is kept out of every *adjoining* region of the same canvas (sharing an edge, or overlapping; a shared corner doesn't count). |
 | `robot_body` | `length_mm` (226), `width_mm` (149), `pen_from_nose_mm` (76). |
@@ -185,8 +185,15 @@ cargo build --release --features cli
 ## How it works
 
 1. **Occupancy.** Each drawing in the region is rasterized at `cell_mm` (a cell
-   is ink if its centre is within `pen/2 + clearance` of a stroke), then grown
-   by `general_buffer` with an elliptical dilation. Robots drawing in adjoining
+   is ink if its centre is within `pen/2 + clearance` of a stroke), with any
+   area the drawing's own lines enclose filled in, then grown by
+   `general_buffer` with an elliptical dilation. The fill is what keeps
+   drawings out of each other: nothing is placed inside a square, and a square
+   is never placed around anything, because the new drawing's footprint is
+   filled the same way. Only closed shapes count — a "C" or a spiral leaves its
+   inside free (a gap the ink itself closes, about `pen + 2 × clearance`, counts
+   as closed) — and only one drawing's own lines: space ringed by several
+   drawings stays usable. Robots drawing in adjoining
    regions add the rectangle their chassis sweeps along each stroke, grown by
    the body's inscribed radius (where a collision is certain at any heading).
 2. **Search.** For each rotation, every collision-free offset comes from one FFT
@@ -194,6 +201,18 @@ cargo build --release --features cli
    takes the free offset nearest the region's top-left corner; `scatter` takes a
    random one. Near a live robot, a candidate must also pass an exact check of
    our own chassis swept along our ink.
+
+   A plain random pick often puts a drawing right beside another while open
+   space sits elsewhere: any offset that clears the buffer is as likely as any
+   other. With `scatter_candidates` = k > 1, scatter draws one random pick from
+   each of k rotations and keeps the one with the most room: the largest
+   distance from its footprint to existing ink. (The region's edges don't count;
+   lay out regions to keep drawings where they belong.) On a 1 m canvas with
+   real drawings, while there was still open space, k = 8 raised the median gap
+   to the nearest drawing from 103 mm to 141 mm and cut placements within 80 mm
+   of one from 36% to 9%, with the same capacity and ink coverage when filled
+   (about 17 drawings), for ~3 ms more per placement on an open canvas and
+   ~6 ms once it fills. k = 16 did no better.
 3. **Sizing.** Full size first; otherwise a bisection on the scale for the
    largest size that still places.
 

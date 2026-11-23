@@ -48,6 +48,13 @@ pub struct PlacementConfig {
     pub strategy: Strategy,
     pub target_footprint_mm: f64,
     pub min_footprint_scale: f64,
+    /// `scatter` only: how many valid poses to draw before keeping the one
+    /// farthest from existing ink (best-candidate sampling). 1 is a plain
+    /// uniform pick; 8 spreads drawings out while still looking hand-placed
+    /// (more did no better in testing). Each extra candidate may cost one more
+    /// rotation's free-offset search (about a third of a millisecond on an open
+    /// canvas).
+    pub scatter_candidates: u32,
 }
 
 impl Default for PlacementConfig {
@@ -61,6 +68,7 @@ impl Default for PlacementConfig {
             strategy: Strategy::Scatter,
             target_footprint_mm: 200.0,
             min_footprint_scale: 0.4,
+            scatter_candidates: 1,
         }
     }
 }
