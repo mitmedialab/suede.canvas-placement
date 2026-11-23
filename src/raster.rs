@@ -198,7 +198,13 @@ impl Footprint {
 
 /// Rasterize strokes into a footprint whose ink is `half_width_cells +
 /// INK_RADIUS_EXTRA` cells thick on each side of the centreline (canvas.py
-/// `rasterize`, same frame and mask size). `None` if there are no points.
+/// `rasterize`, same frame and mask size), with any area the drawing's own
+/// lines enclose filled in (see [`fill_enclosed`]). `None` if there are no
+/// points.
+///
+/// The fill is what keeps drawings out of each other: a reserved square covers
+/// its inside as well as its outline, so nothing is placed inside it, and a new
+/// square's footprint covers its inside, so it is never placed around anything.
 pub fn rasterize(strokes: &[Stroke], cell_mm: f64, half_width_cells: i64) -> Option<Footprint> {
     let (min_x, min_y, max_x, max_y) = bounds(strokes)?;
     let pad = half_width_cells + 1;
@@ -221,7 +227,58 @@ pub fn rasterize(strokes: &[Stroke], cell_mm: f64, half_width_cells: i64) -> Opt
             }
         }
     }
+    fill_enclosed(&mut mask);
     Some(Footprint { mask, ..fp })
+}
+
+/// Set every empty cell that can't be reached from the mask's border by
+/// stepping between empty cells up, down, left or right: the areas the set
+/// cells enclose. A shape with an opening wider than its ink (a "C", a spiral)
+/// encloses nothing; one whose gaps the ink closes counts as closed.
+///
+/// Empty cells only connect side to side, so ink touching only at a corner
+/// still seals: the complement of an 8-connected wall, the standard pairing.
+pub fn fill_enclosed(mask: &mut Mask) {
+    let (rows, cols) = (mask.rows, mask.cols);
+    if rows == 0 || cols == 0 {
+        return;
+    }
+    let mut outside = vec![false; rows * cols];
+    let mut stack: Vec<usize> = Vec::new();
+    let visit = |i: usize, outside: &mut Vec<bool>, stack: &mut Vec<usize>| {
+        if mask.data[i] == 0 && !outside[i] {
+            outside[i] = true;
+            stack.push(i);
+        }
+    };
+    for c in 0..cols {
+        visit(c, &mut outside, &mut stack);
+        visit((rows - 1) * cols + c, &mut outside, &mut stack);
+    }
+    for r in 0..rows {
+        visit(r * cols, &mut outside, &mut stack);
+        visit(r * cols + cols - 1, &mut outside, &mut stack);
+    }
+    while let Some(i) = stack.pop() {
+        let (r, c) = (i / cols, i % cols);
+        if r > 0 {
+            visit(i - cols, &mut outside, &mut stack);
+        }
+        if r + 1 < rows {
+            visit(i + cols, &mut outside, &mut stack);
+        }
+        if c > 0 {
+            visit(i - 1, &mut outside, &mut stack);
+        }
+        if c + 1 < cols {
+            visit(i + 1, &mut outside, &mut stack);
+        }
+    }
+    for (v, &out) in mask.data.iter_mut().zip(&outside) {
+        if !out {
+            *v = 1;
+        }
+    }
 }
 
 /// The chassis swept along a footprint's ink, in the same frame but with a
@@ -447,6 +504,48 @@ mod tests {
         m.fill_capsule((1.0, 2.5), (9.0, 2.5), 0.6);
         assert!((1..9).all(|j| m.get(2, j)));
         assert!(!m.get(0, 5) && !m.get(4, 5));
+    }
+
+    /// Square outline, side `s` mm, corner at the origin.
+    fn square(s: f64) -> Vec<Stroke> {
+        vec![vec![(0.0, 0.0), (s, 0.0), (s, s), (0.0, s), (0.0, 0.0)]]
+    }
+
+    #[test]
+    fn closed_shapes_reserve_their_inside() {
+        // 200mm square at 5mm cells, ink 2 cells either side: the middle is far
+        // from any ink, yet covered.
+        let fp = rasterize(&square(200.0), 5.0, 2).unwrap();
+        let (cx, cy) = fp.to_px((100.0, 100.0));
+        assert!(fp.mask.get(cy as usize, cx as usize), "the inside of a closed square should be reserved");
+        // Everything between the outline's outer edges is covered: a solid block.
+        let (r0, c0, r1, c1) = fp.mask.bbox().unwrap();
+        let block = (r1 - r0 + 1) * (c1 - c0 + 1);
+        assert!(fp.mask.count() as f64 > block as f64 * 0.97, "{} of {} cells", fp.mask.count(), block);
+    }
+
+    #[test]
+    fn open_shapes_leave_their_inside_free() {
+        // A "C": the square without most of its right side (a 100mm opening).
+        let c = vec![vec![(200.0, 50.0), (200.0, 0.0), (0.0, 0.0), (0.0, 200.0), (200.0, 200.0), (200.0, 150.0)]];
+        let fp = rasterize(&c, 5.0, 2).unwrap();
+        let (cx, cy) = fp.to_px((100.0, 100.0));
+        assert!(!fp.mask.get(cy as usize, cx as usize), "an open shape's inside should stay free");
+    }
+
+    #[test]
+    fn each_closed_loop_fills_separately() {
+        // Two separate squares in one drawing, 100mm apart: both insides fill,
+        // the space between them doesn't.
+        let mut two = square(100.0);
+        two.push(vec![(200.0, 0.0), (300.0, 0.0), (300.0, 100.0), (200.0, 100.0), (200.0, 0.0)]);
+        let fp = rasterize(&two, 5.0, 2).unwrap();
+        let at = |x: f64, y: f64| {
+            let (c, r) = fp.to_px((x, y));
+            fp.mask.get(r as usize, c as usize)
+        };
+        assert!(at(50.0, 50.0) && at(250.0, 50.0));
+        assert!(!at(150.0, 50.0), "the gap between two loops is not enclosed by either");
     }
 
     #[test]

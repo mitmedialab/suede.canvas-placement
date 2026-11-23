@@ -719,6 +719,62 @@ mod tests {
         }
     }
 
+    /// A square outline in world mm.
+    fn world_square(x: f64, y: f64, side: f64) -> Vec<Stroke> {
+        vec![vec![(x, y), (x + side, y), (x + side, y + side), (x, y + side), (x, y)]]
+    }
+
+    fn inside(square: &[Stroke], drawing: &[Stroke]) -> bool {
+        let (x0, y0, x1, y1) = bounds(square).unwrap();
+        let (a0, b0, a1, b1) = bounds(drawing).unwrap();
+        a0 > x0 && b0 > y0 && a1 < x1 && b1 < y1
+    }
+
+    #[test]
+    fn nothing_is_placed_inside_a_closed_drawing() {
+        // A 600mm square in the middle of the canvas: scatter places small
+        // squares all around it, and never inside.
+        let big = world_square(200.0, 200.0, 600.0);
+        for k in [1, 8] {
+            let mut drawings = vec![DrawingSpec { robot_name: "bot".into(), strokes: big.clone() }];
+            for i in 0..30 {
+                let mut req = request(Strategy::Scatter, drawings.clone());
+                req.canvas.regions[0].config.scatter_candidates = k;
+                req.canvas.regions[0].config.target_footprint_mm = 100.0;
+                req.seed = 77 + i;
+                let Some(p) = place(&req).unwrap() else { break };
+                let world: Vec<Stroke> = local_strokes(&req.job.commands, p.scale, p.angle_deg)
+                    .into_iter()
+                    .map(|s| s.into_iter().map(|(x, y)| (x + p.anchor_x, y + p.anchor_y)).collect())
+                    .collect();
+                assert!(!inside(&big, &world), "k={k}: drawing {i} was placed inside the square");
+                drawings.push(DrawingSpec { robot_name: "bot".into(), strokes: world });
+            }
+            assert!(drawings.len() > 10, "k={k}: placed only {}", drawings.len() - 1);
+        }
+    }
+
+    #[test]
+    fn a_closed_drawing_is_never_placed_around_another() {
+        // A small drawing sits mid-canvas; big squares (500mm) are placed one by
+        // one. None may surround it, though plenty of offsets would fit its outline
+        // around it.
+        let small = world_square(470.0, 470.0, 60.0);
+        for seed in 0..20 {
+            let mut req = request(Strategy::Scatter, vec![DrawingSpec { robot_name: "bot".into(), strokes: small.clone() }]);
+            req.canvas.regions[0].config.target_footprint_mm = 500.0;
+            req.canvas.general_buffer = 0.0;
+            req.seed = seed;
+            if let Some(p) = place(&req).unwrap() {
+                let world: Vec<Stroke> = local_strokes(&req.job.commands, p.scale, p.angle_deg)
+                    .into_iter()
+                    .map(|s| s.into_iter().map(|(x, y)| (x + p.anchor_x, y + p.anchor_y)).collect())
+                    .collect();
+                assert!(!inside(&world, &small), "seed {seed}: the square was placed around the small drawing");
+            }
+        }
+    }
+
     #[test]
     fn clearance_map_measures_distance_to_ink() {
         let mut ink = Mask::new(10, 20);
