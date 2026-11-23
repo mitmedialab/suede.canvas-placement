@@ -5,8 +5,13 @@ name: build-release
 # them to a GitHub Release, so a consumer that only wants the compiled module
 # can install it without a Rust toolchain:
 #
+#   canvas-placement-node-<ver>.tgz   wasm + CommonJS glue   (npm install <url>)
+#   canvas-placement-web-<ver>.tgz    wasm + ES-module glue  (npm install <url>)
 #   canvas_placement-<ver>-*.whl      abi3 wheels, Python >= 3.11 (pip install <url>)
 #   canvas_placement-<ver>.tar.gz     sdist (builds from source, needs Rust)
+#
+# The web build and the web/ demo are also deployed to GitHub Pages, because a
+# browser cannot load release assets directly (they are served without CORS).
 #
 # Publishing: push a tag `v<version>` matching release/Cargo.toml, or run the
 # workflow by hand (it tags the current commit as `v<version>`). Pull requests
@@ -17,23 +22,31 @@ on:
   pull_request:
     paths:
       - "release/**"
+      - "web/**"
       - ".github/workflows/build-release.yml"
   workflow_dispatch:
 
 permissions:
   contents: read
 
+env:
+  # Ubuntu's apt binaryen (v108) corrupts wasm-bindgen's externref table.
+  BINARYEN_VERSION: version_123
+
 jobs:
   version:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.v.outputs.version }}
+      wasm_bindgen: ${{ steps.v.outputs.wasm_bindgen }}
     steps:
       - uses: actions/checkout@v4
       - id: v
         run: |
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' release/Cargo.toml | head -1)
+          wbg=$(grep -A1 '^name = "wasm-bindgen"$' release/Cargo.lock | sed -n 's/^version = "\(.*\)"/\1/p')
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "wasm_bindgen=$wbg" >> "$GITHUB_OUTPUT"
           if [[ "$GITHUB_REF" == refs/tags/* && "$GITHUB_REF_NAME" != "v$version" ]]; then
             echo "::error::tag $GITHUB_REF_NAME does not match release/Cargo.toml version $version"
             exit 1
@@ -46,6 +59,97 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test --release --manifest-path release/Cargo.toml
       - run: cargo build --release --features cli --manifest-path release/Cargo.toml
+
+  wasm:
+    needs: [version, test]
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      # wasm-bindgen-cli must match the wasm-bindgen crate version in Cargo.lock.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen@${{ needs.version.outputs.wasm_bindgen }}
+      - name: Install binaryen
+        run: |
+          curl -fsSL "https://github.com/WebAssembly/binaryen/releases/download/$BINARYEN_VERSION/binaryen-$BINARYEN_VERSION-x86_64-linux.tar.gz" \
+            | tar xz -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/binaryen-$BINARYEN_VERSION/bin" >> "$GITHUB_PATH"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - run: bash release/build_wasm.sh
+
+      # wasm-bindgen (unlike wasm-pack) writes no package.json, so add one per target.
+      - name: Package
+        run: |
+          mkdir -p dist
+          for target in node web; do
+            dir="release/pkg-$target"
+            TARGET=$target node -e '
+              const fs = require("fs");
+              const t = process.env.TARGET;
+              const pkg = {
+                name: `canvas-placement-${t}`,
+                version: process.env.VERSION,
+                description: `canvas_placement compiled to WebAssembly (${t === "node" ? "Node.js, CommonJS" : "browser, ES module"})`,
+                license: "MIT",
+                repository: { type: "git", url: `https://github.com/${process.env.GITHUB_REPOSITORY}` },
+                main: "canvas_placement.js",
+                types: "canvas_placement.d.ts",
+                files: ["*.js", "*.d.ts", "*.wasm", "snippets/"],
+              };
+              if (t === "web") Object.assign(pkg, { type: "module", module: "canvas_placement.js", sideEffects: ["./snippets/*"] });
+              fs.writeFileSync(process.argv[1], JSON.stringify(pkg, null, 2) + "\n");
+            ' "$dir/package.json"
+            (cd "$dir" && npm pack --pack-destination "$GITHUB_WORKSPACE/dist")
+          done
+          ls -la dist
+
+      - name: Smoke-test the Node package
+        run: |
+          cd "$RUNNER_TEMP" && npm init -y >/dev/null
+          npm install "$GITHUB_WORKSPACE/dist/canvas-placement-node-$VERSION.tgz"
+          node -e '
+            const cp = require("canvas-placement-node");
+            const square = [];
+            for (let i = 0; i < 4; i++) square.push({ kind: "line", distance: 100, penDown: true }, { kind: "spin", degrees: 90 });
+            const canvas = { general_buffer: 25, regions: [{ id: "r", x: 0, y: 0, width: 1000, height: 1000,
+                             robot: "bot", config: { strategy: "origin" } }] };
+            const req = { canvas, region_id: "r", job: { commands: square, heading0: 0, native_span: 100 } };
+            const p = cp.place(req);
+            if (!p || p.scale_fraction !== 1) throw new Error("unexpected placement: " + JSON.stringify(p));
+            if (JSON.stringify(JSON.parse(cp.place_json(JSON.stringify(req)))) !== JSON.stringify(p)) throw new Error("place_json differs");
+            const drawing = { robot_name: "bot", strokes: [[[0, 0], [100, 0]]] };
+            if (!(cp.free_fractions({ canvas, drawings: [drawing] }).r < 1)) throw new Error("free_fractions");
+            let threw = false;
+            try { cp.place({ ...req, region_id: "nope" }); } catch (e) { threw = true; }
+            if (!threw) throw new Error("a bad request should throw");
+            console.log("ok:", JSON.stringify(p));
+          '
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-wasm
+          path: dist/*
+
+      # Browsers can't load release assets (no CORS headers), so the web build is
+      # also served from GitHub Pages, together with the web/ demo that loads it.
+      - name: Assemble Pages site
+        run: |
+          mkdir -p site/pkg-web
+          cp web/index.html site/
+          cp -r release/pkg-web/*.js release/pkg-web/*.d.ts release/pkg-web/*.wasm release/pkg-web/snippets site/pkg-web/
+          printf '{"version": "%s", "commit": "%s"}\n' "$VERSION" "$GITHUB_SHA" > site/pkg-web/version.json
+          touch site/.nojekyll
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
 
   wheels:
     needs: [version, test]
@@ -112,7 +216,7 @@ jobs:
           path: release/dist/*
 
   publish:
-    needs: [version, wheels, sdist]
+    needs: [version, wasm, wheels, sdist]
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     permissions:
@@ -134,6 +238,17 @@ jobs:
           cat > notes.md <<EOF
           Built from \`release/\` at $GITHUB_SHA.
 
+          **Node.js** (CommonJS)
+          \`\`\`
+          npm install $base/canvas-placement-node-$VERSION.tgz
+          \`\`\`
+
+          **Browser / bundler** (ES module, call the default-exported \`init()\` first)
+          \`\`\`
+          npm install $base/canvas-placement-web-$VERSION.tgz
+          \`\`\`
+          or load it from GitHub Pages: https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}/pkg-web/canvas_placement.js
+
           **Python** >= 3.11 (pip picks the right wheel for your platform)
           \`\`\`
           pip install canvas-placement --find-links https://github.com/$GITHUB_REPOSITORY/releases/expanded_assets/$TAG
@@ -149,3 +264,18 @@ jobs:
             gh release create "$TAG" dist/* --title "$TAG" --notes-file notes.md \
               --target "$GITHUB_SHA" --repo "$GITHUB_REPOSITORY"
           fi
+
+  # Serves the latest release's web build + demo at
+  # https://<owner>.github.io/<repo>/ (Settings -> Pages -> Source: GitHub Actions).
+  pages:
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v4
