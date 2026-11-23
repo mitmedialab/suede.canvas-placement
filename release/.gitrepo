@@ -6,7 +6,7 @@
 [subrepo]
 	remote = https://github.com/mitmedialab/suede.canvas-placement
 	branch = release
-	commit = 5abf63f1e3c180de7837b307cc47600cd7d63301
-	parent = 231162c52440b272fd5db1fca5fa23b762752df4
+	commit = 73b2eb7191d3483ef662a46a2bb8c33346915354
+	parent = 0b1c9adbca08784fdc2a85f4fb6d36dac6595624
 	method = merge
 	cmdver = 0.4.9

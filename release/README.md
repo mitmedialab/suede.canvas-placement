@@ -12,16 +12,18 @@ little as possible; if it doesn't fit even at the minimum size, the answer is
 "nowhere".
 
 This folder is the complete source: the Rust crate (`Cargo.toml`, `src/`), the
-`placement` CLI, and the Python extension (`pyproject.toml`). All commands
-below run from this folder.
+`placement` CLI, the Python extension (`pyproject.toml`) and the WebAssembly
+build (`build_wasm.sh`). All commands below run from this folder. MIT licensed.
 
 ## Stateless
 
 Nothing is kept between calls. Every call rebuilds the region's occupancy from
 the `drawings` you pass, so **your list of placed drawings is the only record**
 of what space is taken. To reserve a drawing, add it to the list; to clear a
-canvas, empty it. Same request plus same `seed` gives the same answer, on any
-platform, so a request saved as JSON can be replayed anywhere (see the CLI).
+canvas, empty it. Same request plus same `seed` gives the same placement, on any
+platform and in every build — Python, CLI, WebAssembly — so a request saved as
+JSON can be replayed anywhere (see the CLI). From JavaScript, keep seeds within
+`Number.MAX_SAFE_INTEGER` (see below).
 
 Rebuilding costs about 0.05–0.1 ms per drawing already in the region, which is
 small next to the search itself.
@@ -85,6 +87,60 @@ robot there facing `heading0 + angle_deg`, then run the commands scaled by
 relative to the region's target size, and `attempts` counts the searches run
 (1 means it fitted at full size).
 
+## Using it from JavaScript
+
+The same three calls, with the same request and result shapes as Python, for
+the browser or Node. Each also comes as `place_json` / `free_fractions_json` /
+`occupancy_json`, taking and returning JSON strings. A bad request throws.
+
+```js
+import init, { place, free_fractions } from "./pkg-web/canvas_placement.js";
+await init();                                    // loads canvas_placement_bg.wasm (same directory)
+
+const result = place({
+  canvas,                                        // as in the Python example
+  drawings: [{ robot_name: "bot1", strokes: [[[0, 0], [100, 0]]] }],
+  active: {},
+  region_id: "r",
+  job: { commands, heading0: 0, native_span: 40 },
+  seed: 1234,                                    // keep <= Number.MAX_SAFE_INTEGER
+  budget_ms: 1000,
+});
+// -> null, or { angle_deg, anchor_x, anchor_y, scale, scale_fraction, attempts, free_fraction_after }
+```
+
+From Node, `require("canvas-placement-node")` (or `./pkg-node/canvas_placement.js`)
+gives the same functions with no `init()`. In `occupancy` results each grid is an
+array of `rows * cols` 0/1 numbers.
+
+**Seeds:** a JS number holds integers exactly only up to 2^53 − 1. A larger seed
+is rounded on its way in, so it still gives a valid placement, just not the one
+the same seed gives natively. Within that range, the wasm build places exactly
+as the native ones do (checked on real requests; anchors may differ in the last
+bit, since `sin`/`cos` aren't bit-identical across platforms).
+
+The module has no runtime dependencies and runs on the calling thread; a
+placement takes roughly 1–50 ms depending on how full the region is, so for UI
+work call it from a Web Worker. The page must be served over HTTP (not
+`file://`), because the glue fetches the `.wasm`.
+
+## Prebuilt builds
+
+Every [GitHub release](https://github.com/mitmedialab/suede.canvas-placement/releases)
+carries npm packages of the WebAssembly build:
+
+```
+# Node.js (CommonJS)
+npm install https://github.com/mitmedialab/suede.canvas-placement/releases/download/v<ver>/canvas-placement-node-<ver>.tgz
+# Browser / bundler (ES module)
+npm install https://github.com/mitmedialab/suede.canvas-placement/releases/download/v<ver>/canvas-placement-web-<ver>.tgz
+```
+
+Browsers can't load release assets directly (GitHub serves them without CORS
+headers), so the latest browser build is also on GitHub Pages:
+`https://mitmedialab.github.io/suede.canvas-placement/pkg-web/canvas_placement.js`,
+next to a small demo at `https://mitmedialab.github.io/suede.canvas-placement/`.
+
 ## Prebuilt wheels
 
 Every [GitHub release](https://github.com/mitmedialab/suede.canvas-placement/releases)
@@ -102,6 +158,18 @@ pip install maturin
 maturin build --release --out dist        # or: maturin develop --release
 cargo test --release                      # Rust unit tests
 ```
+
+The WebAssembly build needs the `wasm32-unknown-unknown` target and
+`wasm-bindgen-cli` at the version of `wasm-bindgen` in `Cargo.lock`:
+
+```
+rustup target add wasm32-unknown-unknown
+cargo install wasm-bindgen-cli --version <version in Cargo.lock> --locked
+./build_wasm.sh                           # -> pkg-web/ (browser) and pkg-node/ (Node)
+```
+
+`wasm-opt -O3` (Binaryen ≥ 117) is applied when it's on the `PATH`; older
+versions are skipped because they break the module.
 
 ## The CLI
 
@@ -144,4 +212,5 @@ cargo build --release --features cli
 Module map: `engine.rs` (occupancy, search, sizing), `raster.rs` (rasterizers,
 dilation, distance transform), `fftcorr.rs` (FFT correlation), `geometry.rs`
 (turtle commands to strokes, body sweep), `rng.rs` (seeded SplitMix64),
-`types.rs` (request/response), `python.rs` (PyO3 bindings).
+`types.rs` (request/response), `python.rs` (PyO3 bindings), `wasm.rs`
+(WebAssembly bindings), `clock.rs` (the shrink-to-fit time budget).
